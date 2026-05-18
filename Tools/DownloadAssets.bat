@@ -7,14 +7,14 @@ echo     [팀원용] 유료 에셋 최신 버전 다운로드 및 동기화
 echo =======================================================
 echo.
 
-where python >nul 2>nul
+where py >nul 2>nul
 if %errorlevel% neq 0 (
     echo [-] 에러: 시스템에 Python이 설치되어 있지 않거나 PATH에 등록되지 않았습니다.
     pause
     exit /b
 )
 
-python "%~dp0sync_assets.py" --download
+py "%~dp0sync_assets.py" --download
 
 echo.
 echo =======================================================
