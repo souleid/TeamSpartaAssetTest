@@ -7,7 +7,7 @@ from datetime import datetime
 # ==========================================
 # 환경 설정 (config.json이 없으면 아래 기본값을 씁니다)
 # ==========================================
-GDRIVE_SHARED_DIR = "G:\내 드라이브\PaidAssets"
+GDRIVE_SHARED_DIR = "G:/내 드라이브/Unreal7th_PaidAssets"
 
 # Setup.bat이 생성한 config.json 파일이 있으면 해당 경로를 최우선으로 로드
 CONFIG_FILE_PATH = os.path.join(os.path.dirname(__file__), "config.json")
@@ -26,10 +26,7 @@ NOTES_NAME = "UpdatedNotes.txt"
 
 
 def get_asset_fingerprint(file_path):
-    """
-    [성능 최적화] 파일 크기와 수정 시간을 조합해 지문(Fingerprint)을 만듭니다.
-    디스크 전체를 읽지 않으므로 수십 기가바이트의 파일도 0초 만에 체크합니다.
-    """
+    """파일 크기와 수정 시간을 조합해 지문(Fingerprint)을 만듭니다."""
     try:
         size = os.path.getsize(file_path)
         mtime = os.path.getmtime(file_path)
@@ -37,6 +34,26 @@ def get_asset_fingerprint(file_path):
     except Exception as e:
         print(f"[-] 파일 메타데이터 조회 실패 ({file_path}): {e}")
         return None
+
+
+def is_fingerprint_equal(fp1, fp2):
+    """
+    [★ 핵심 추가] 두 지문을 비교하되, 파일 크기가 일치하고 
+    수정 시간 차이가 2초 이내라면 구글 드라이브 앱 특성에 의한 오차로 보고 '동일 파일'로 인정합니다.
+    """
+    try:
+        size1, mtime1 = fp1.split('_')
+        size2, mtime2 = fp2.split('_')
+        
+        # 1. 파일 크기가 다르면 무조건 다른 파일
+        if size1 != size2:
+            return False
+            
+        # 2. 파일 크기가 같다면 시간 오차가 2초 이내인지 판별 (밀리초 단위 버림 에러 방어)
+        time_delta = abs(float(mtime1) - float(mtime2))
+        return time_delta <= 2.0
+    except Exception:
+        return False
 
 
 def scan_local_assets():
@@ -88,9 +105,12 @@ def run_upload():
     old_manifest = load_json_manifest(local_manifest_path)
     old_files = old_manifest.get("files", {})
 
+    # [수정] 단순 문자열 비교 시 소수점 버림 현상으로 오탐지가 나므로 정밀 함수로 비교
     files_to_upload = []
     for rel_path, current_fingerprint in current_local_files.items():
-        if rel_path not in old_files or old_files[rel_path] != current_fingerprint:
+        if rel_path not in old_files:
+            files_to_upload.append(rel_path)
+        elif not is_fingerprint_equal(current_fingerprint, old_files[rel_path]):
             files_to_upload.append(rel_path)
 
     files_to_delete = [p for p in old_files if p not in current_local_files]
@@ -108,7 +128,6 @@ def run_upload():
     if not note_input:
         note_input = "정기 에셋 업데이트"
 
-    # 1. 차분 업로드 진행
     for rel_path in files_to_upload:
         src = os.path.join(LOCAL_PAID_DIR, rel_path)
         dst = os.path.join(GDRIVE_SHARED_DIR, rel_path)
@@ -116,14 +135,12 @@ def run_upload():
         shutil.copy2(src, dst)
         print(f" -> [업로드 완료] {rel_path}")
 
-    # 2. 드라이브 청소 (로컬에서 지워진 파일 반영)
     for rel_path in files_to_delete:
         dst = os.path.join(GDRIVE_SHARED_DIR, rel_path)
         if os.path.exists(dst):
             os.remove(dst)
             print(f" -> [드라이브 파일 삭제] {rel_path}")
 
-    # 3. 매니페스트 정보 업데이트 및 저장
     new_version = old_manifest.get("version", 0) + 1
     new_manifest = {
         "version": new_version,
@@ -134,11 +151,9 @@ def run_upload():
     save_json_manifest(local_manifest_path, new_manifest)
     save_json_manifest(gdrive_manifest_path, new_manifest)
 
-    # 4. 릴리즈 노트 최신순(내림차순) 누적 기록 처리
     local_notes_path = os.path.join(LOCAL_PAID_DIR, NOTES_NAME)
     gdrive_notes_path = os.path.join(GDRIVE_SHARED_DIR, NOTES_NAME)
     
-    # 신규 로그 문자열 조립 (파일 리스트 포함)
     log_entry = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Version {new_version}]\n"
     log_entry += f" 📢 변경 사항: {note_input}\n"
     
@@ -154,7 +169,6 @@ def run_upload():
             
     log_entry += "="*50 + "\n\n"
     
-    # 로컬과 드라이브 양쪽에 최신순(Prepend)으로 쓰기
     for path in [local_notes_path, gdrive_notes_path]:
         existing_content = ""
         if os.path.exists(path):
@@ -163,8 +177,6 @@ def run_upload():
                     existing_content = f.read()
             except Exception:
                 pass
-        
-        # 새 로그를 기존 내용 앞에 결합하여 저장
         with open(path, "w", encoding="utf-8") as f:
             f.write(log_entry + existing_content)
 
@@ -184,9 +196,12 @@ def run_download():
     remote_files = remote_manifest.get("files", {})
     current_local_files = scan_local_assets()
     
+    # [수정] 다운로드 단계에서도 시간 오차 보정 함수를 사용하여 불필요한 재다운로드 방지
     files_to_download = []
     for rel_path, remote_fingerprint in remote_files.items():
-        if rel_path not in current_local_files or current_local_files[rel_path] != remote_fingerprint:
+        if rel_path not in current_local_files:
+            files_to_download.append(rel_path)
+        elif not is_fingerprint_equal(current_local_files[rel_path], remote_fingerprint):
             files_to_download.append(rel_path)
 
     files_to_delete = [p for p in current_local_files if p not in remote_files]
@@ -197,7 +212,6 @@ def run_download():
 
     print(f"[*] 동기화 필요 -> 다운로드: {len(files_to_download)}개, 로컬 파일 정리: {len(files_to_delete)}개")
 
-    # 차분 다운로드 진행
     for rel_path in files_to_download:
         src = os.path.join(GDRIVE_SHARED_DIR, rel_path)
         dst = os.path.join(LOCAL_PAID_DIR, rel_path)
@@ -206,14 +220,12 @@ def run_download():
             shutil.copy2(src, dst)
             print(f" -> [다운로드 완료] {rel_path}")
 
-    # 고립된 로컬 파일 삭제 (클린 싱크)
     for rel_path in files_to_delete:
         dst = os.path.join(LOCAL_PAID_DIR, rel_path)
         if os.path.exists(dst):
             os.remove(dst)
             print(f" -> [로컬 고립 파일 제거] {rel_path}")
 
-    # 최종 메타데이터(매니페스트 및 패치노트) 동기화
     shutil.copy2(gdrive_manifest_path, os.path.join(LOCAL_PAID_DIR, MANIFEST_NAME))
     gdrive_notes_path = os.path.join(GDRIVE_SHARED_DIR, NOTES_NAME)
     if os.path.exists(gdrive_notes_path):
