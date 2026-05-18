@@ -2,16 +2,15 @@ import os
 import sys
 import json
 import shutil
-import threading
-from concurrent.futures import ThreadPoolExecutor
+import hashlib
 from datetime import datetime
 
 # ==========================================
-# 환경 설정 (config.json이 없으면 아래 기본값을 씁니다)
+# 환경 설정
 # ==========================================
 GDRIVE_SHARED_DIR = "G:/내 드라이브/Unreal7th_PaidAssets"
 
-# Setup.bat이 생성한 config.json 파일이 있으면 해당 경로를 최우선으로 로드
+# Setup.bat이 생성한 config.json 로드
 CONFIG_FILE_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 if os.path.exists(CONFIG_FILE_PATH):
     try:
@@ -20,51 +19,41 @@ if os.path.exists(CONFIG_FILE_PATH):
             if "gdrive_path" in config_data:
                 GDRIVE_SHARED_DIR = config_data["gdrive_path"].strip()
     except Exception as e:
-        print(f"[-] 설정 파일(config.json)을 읽는 중 오류 발생: {e}")
+        print(f"[-] 설정 파일(config.json) 로드 실패: {e}")
+
+# 경로 정밀 조준 가드 (PaidAssets 폴더 강제 매핑)
+if not GDRIVE_SHARED_DIR.replace("\\", "/").endswith("PaidAssets") and not GDRIVE_SHARED_DIR.replace("\\", "/").endswith("PaidAssets/"):
+    GDRIVE_PAID_DIR = os.path.join(GDRIVE_SHARED_DIR, "PaidAssets").replace("\\", "/")
+else:
+    GDRIVE_PAID_DIR = GDRIVE_SHARED_DIR.replace("\\", "/")
 
 LOCAL_PAID_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../Content/PaidAssets"))
 MANIFEST_NAME = "UpdatedFileList.json"
 NOTES_NAME = "UpdatedNotes.txt"
-MAX_WORKERS = 8  # 구글 드라이브 동기화 폴더 대상이므로 과도하면 디스크/네트워크 경합으로 오히려 느려짐
+
+# 마스터(업로더)의 고속 스캔을 위한 로컬 전용 캐시 파일
+UPLOADER_CACHE_PATH = os.path.join(os.path.dirname(__file__), ".uploader_cache.json")
 
 
-def get_asset_fingerprint(file_path):
-    """파일 크기와 수정 시간을 조합해 지문(Fingerprint)을 만듭니다."""
+def calculate_md5(file_path):
+    """파일의 실제 내용물을 기반으로 변하지 않는 고유 MD5 해시를 계산합니다."""
+    hash_md5 = hashlib.md5()
     try:
-        size = os.path.getsize(file_path)
-        mtime = os.path.getmtime(file_path)
-        return f"{size}_{mtime}"
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
     except Exception as e:
-        print(f"[-] 파일 메타데이터 조회 실패 ({file_path}): {e}")
+        print(f"[-] 해시 계산 실패 ({file_path}): {e}")
         return None
 
 
-def is_fingerprint_equal(fp1, fp2):
-    """
-    [★ 핵심 추가] 두 지문을 비교하되, 파일 크기가 일치하고 
-    수정 시간 차이가 2초 이내라면 구글 드라이브 앱 특성에 의한 오차로 보고 '동일 파일'로 인정합니다.
-    """
-    try:
-        size1, mtime1 = fp1.split('_')
-        size2, mtime2 = fp2.split('_')
-        
-        # 1. 파일 크기가 다르면 무조건 다른 파일
-        if size1 != size2:
-            return False
-            
-        # 2. 파일 크기가 같다면 시간 오차가 2초 이내인지 판별 (밀리초 단위 버림 에러 방어)
-        time_delta = abs(float(mtime1) - float(mtime2))
-        return time_delta <= 2.0
-    except Exception:
-        return False
-
-
-def scan_local_assets():
-    """로컬 PaidAssets 폴더를 스캔하여 에셋들의 고유 지문 맵을 생성합니다."""
-    asset_map = {}
+def get_local_mtime_size_map():
+    """업로더 PC의 파일 실시간 수정시간/크기 맵을 만듭니다."""
+    meta_map = {}
     if not os.path.exists(LOCAL_PAID_DIR):
         os.makedirs(LOCAL_PAID_DIR, exist_ok=True)
-        return asset_map
+        return meta_map
 
     for root, dirs, files in os.walk(LOCAL_PAID_DIR):
         for file in files:
@@ -72,117 +61,100 @@ def scan_local_assets():
                 continue
             full_path = os.path.join(root, file)
             rel_path = os.path.relpath(full_path, LOCAL_PAID_DIR).replace("\\", "/")
-            
-            fingerprint = get_asset_fingerprint(full_path)
-            if fingerprint:
-                asset_map[rel_path] = fingerprint
-    return asset_map
+            try:
+                size = os.path.getsize(full_path)
+                mtime = os.path.getmtime(full_path)
+                meta_map[rel_path] = f"{size}_{mtime}"
+            except Exception:
+                pass
+    return meta_map
 
 
-def load_json_manifest(path):
+def load_json(path):
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
-    return {"version": 0, "files": {}}
+    return {}
 
 
-def save_json_manifest(path, data):
+def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 
-_print_lock = threading.Lock()
-
-
-def _safe_print(msg):
-    with _print_lock:
-        print(msg)
-
-
-def parallel_copy(jobs, label):
-    """jobs: list of (src, dst, rel_path). 병렬 복사 후 (성공수, 실패수) 반환."""
-    total = len(jobs)
-    counter = {"done": 0, "failed": 0}
-    lock = threading.Lock()
-
-    def worker(job):
-        src, dst, rel_path = job
-        try:
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
-            with lock:
-                counter["done"] += 1
-                idx = counter["done"] + counter["failed"]
-            _safe_print(f" -> [{label} {idx}/{total}] {rel_path}")
-        except Exception as e:
-            with lock:
-                counter["failed"] += 1
-                idx = counter["done"] + counter["failed"]
-            _safe_print(f" -> [실패 {idx}/{total}] {rel_path}: {e}")
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        list(ex.map(worker, jobs))
-    return counter["done"], counter["failed"]
-
-
-def parallel_delete(jobs, label):
-    """jobs: list of (dst, rel_path). 병렬 삭제 후 (성공수, 실패수) 반환."""
-    total = len(jobs)
-    counter = {"done": 0, "failed": 0}
-    lock = threading.Lock()
-
-    def worker(job):
-        dst, rel_path = job
-        try:
-            if os.path.exists(dst):
-                os.remove(dst)
-            with lock:
-                counter["done"] += 1
-                idx = counter["done"] + counter["failed"]
-            _safe_print(f" -> [{label} {idx}/{total}] {rel_path}")
-        except Exception as e:
-            with lock:
-                counter["failed"] += 1
-                idx = counter["done"] + counter["failed"]
-            _safe_print(f" -> [실패 {idx}/{total}] {rel_path}: {e}")
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        list(ex.map(worker, jobs))
-    return counter["done"], counter["failed"]
+def is_fingerprint_equal(fp1, fp2):
+    """두 지문을 비교하여 파일 크기가 같고 시차가 2초 이내면 동일 파일로 판정합니다."""
+    try:
+        size1, mtime1 = fp1.split('_')
+        size2, mtime2 = fp2.split('_')
+        if size1 != size2:
+            return False
+        return abs(float(mtime1) - float(mtime2)) <= 2.0
+    except Exception:
+        return False
 
 
 def run_upload():
-    print(f"[+] 구글 드라이브 타겟 경로: {GDRIVE_SHARED_DIR}")
+    print(f"[+] 구글 드라이브 최종 동기화 경로: {GDRIVE_PAID_DIR}")
     print("[+] 유료 에셋 업로드 프로세스를 시작합니다. (Git 마스터 권한)")
-    if not os.path.exists(GDRIVE_SHARED_DIR):
-        print(f"[-] 에러: 구글 드라이브 경로를 찾을 수 없습니다.\n    Setup.bat을 다시 실행하거나 경로를 확인하세요: {GDRIVE_SHARED_DIR}")
+    
+    try:
+        os.makedirs(GDRIVE_PAID_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+    if not os.path.exists(GDRIVE_PAID_DIR):
+        print(f"[-] 에러: 구글 드라이브 경로를 찾을 수 없습니다: {GDRIVE_PAID_DIR}")
         return
 
-    current_local_files = scan_local_assets()
+    current_meta_map = get_local_mtime_size_map()
+    gdrive_manifest_path = os.path.join(GDRIVE_PAID_DIR, MANIFEST_NAME)
     local_manifest_path = os.path.join(LOCAL_PAID_DIR, MANIFEST_NAME)
-    gdrive_manifest_path = os.path.join(GDRIVE_SHARED_DIR, MANIFEST_NAME)
     
-    old_manifest = load_json_manifest(local_manifest_path)
-    old_files = old_manifest.get("files", {})
+    remote_manifest = load_json(gdrive_manifest_path)
+    if not remote_manifest:
+        remote_manifest = {"version": 0, "files": {}}
+    remote_files = remote_manifest.get("files", {})
 
-    # [수정] 단순 문자열 비교 시 소수점 버림 현상으로 오탐지가 나므로 정밀 함수로 비교
+    uploader_cache = load_json(UPLOADER_CACHE_PATH)
     files_to_upload = []
-    for rel_path, current_fingerprint in current_local_files.items():
-        if rel_path not in old_files:
-            files_to_upload.append(rel_path)
-        elif not is_fingerprint_equal(current_fingerprint, old_files[rel_path]):
-            files_to_upload.append(rel_path)
+    updated_remote_files = {}
 
-    files_to_delete = [p for p in old_files if p not in current_local_files]
+    # -----------------------------------------------------------------
+    # [★ 핵심 하이브리드 검증 로직]
+    # -----------------------------------------------------------------
+    for rel_path, meta_val in current_meta_map.items():
+        # 1차 필터링: 로컬 캐시와 시간이 다르거나, 원격 매니페스트에 아예 없는 파일인 경우 (의심 파일군)
+        if rel_path not in uploader_cache or not is_fingerprint_equal(uploader_cache[rel_path], meta_val) or rel_path not in remote_files:
+            full_path = os.path.join(LOCAL_PAID_DIR, rel_path)
+            
+            # 메타데이터가 변한 "의심 파일"에 한해서만 정밀 MD5 해시를 계산합니다. (성능 최적화)
+            md5_val = calculate_md5(full_path)
+            
+            if md5_val:
+                # 2차 필터링: 계산된 MD5 해시가 실제 구글 드라이브(원격)에 적힌 해시와 다를 때만 진짜 업로드!
+                if rel_path not in remote_files or remote_files[rel_path] != md5_val:
+                    print(f"[*] 실제 변경 확인 (업로드 대기): {rel_path}")
+                    files_to_upload.append(rel_path)
+                else:
+                    # 저장 버튼만 눌러서 시간만 바뀌고 알맹이는 똑같은 경우 여기에 걸려서 업로드가 패스됩니다.
+                    print(f"[*] 메타데이터 변경되었으나 내용물이 일치함 (업로드 패스): {rel_path}")
+                
+                updated_remote_files[rel_path] = md5_val
+        else:
+            # 1차 메타데이터 검사에서 통과한 깨끗한 파일은 디스크도 안 읽고 기존 원격 MD5를 그대로 상속합니다.
+            updated_remote_files[rel_path] = remote_files[rel_path]
+
+    files_to_delete = [p for p in remote_files if p not in current_meta_map]
 
     if not files_to_upload and not files_to_delete:
         print("[*] 변경된 에셋이 없습니다. 업로드를 종료합니다.")
         return
 
-    print(f"[*] 감지된 변경사항 -> 업로드 대상: {len(files_to_upload)}개, 삭제 대상: {len(files_to_delete)}개")
+    print(f"[*] 최종 변경사항 반영 -> 실제 업로드: {len(files_to_upload)}개, 삭제: {len(files_to_delete)}개")
 
     print("\n" + "="*50)
     print(" 이번 업로드의 변경 사항(릴리즈 노트)을 입력하세요.")
@@ -191,55 +163,53 @@ def run_upload():
     if not note_input:
         note_input = "정기 에셋 업데이트"
 
-    copy_jobs = [
-        (os.path.join(LOCAL_PAID_DIR, rp), os.path.join(GDRIVE_SHARED_DIR, rp), rp)
-        for rp in files_to_upload
-    ]
-    if copy_jobs:
-        print(f"[*] {len(copy_jobs)}개 파일 병렬 업로드 시작 (워커 {MAX_WORKERS}개)")
-        parallel_copy(copy_jobs, "업로드 완료")
+    # 차분 파일 업로드
+    for rel_path in files_to_upload:
+        src = os.path.join(LOCAL_PAID_DIR, rel_path)
+        dst = os.path.join(GDRIVE_PAID_DIR, rel_path)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        print(f" -> [업로드 완료] {rel_path}")
 
-    del_jobs = [(os.path.join(GDRIVE_SHARED_DIR, rp), rp) for rp in files_to_delete]
-    if del_jobs:
-        print(f"[*] {len(del_jobs)}개 파일 병렬 삭제 시작")
-        parallel_delete(del_jobs, "드라이브 파일 삭제")
+    # 구글 드라이브 삭제 파일 청소
+    for rel_path in files_to_delete:
+        dst = os.path.join(GDRIVE_PAID_DIR, rel_path)
+        if os.path.exists(dst):
+            os.remove(dst)
+            print(f" -> [드라이브 파일 삭제] {rel_path}")
 
-    new_version = old_manifest.get("version", 0) + 1
+    # 버전 업데이트
+    new_version = remote_manifest.get("version", 0) + 1
     new_manifest = {
         "version": new_version,
         "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "files": current_local_files
+        "files": updated_remote_files
     }
     
-    save_json_manifest(local_manifest_path, new_manifest)
-    save_json_manifest(gdrive_manifest_path, new_manifest)
+    save_json(gdrive_manifest_path, new_manifest)
+    save_json(local_manifest_path, new_manifest)
+    save_json(UPLOADER_CACHE_PATH, current_meta_map)
 
+    # 내림차순 패치노트 생성
     local_notes_path = os.path.join(LOCAL_PAID_DIR, NOTES_NAME)
-    gdrive_notes_path = os.path.join(GDRIVE_SHARED_DIR, NOTES_NAME)
+    gdrive_notes_path = os.path.join(GDRIVE_PAID_DIR, NOTES_NAME)
     
     log_entry = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Version {new_version}]\n"
     log_entry += f" 📢 변경 사항: {note_input}\n"
-    
     if files_to_upload:
         log_entry += " ➕ 추가/수정된 파일 목록:\n"
-        for f in files_to_upload:
-            log_entry += f"   └── {f}\n"
-            
+        for f in files_to_upload: log_entry += f"   └── {f}\n"
     if files_to_delete:
         log_entry += " ❌ 삭제된 파일 목록:\n"
-        for f in files_to_delete:
-            log_entry += f"   └── {f}\n"
-            
+        for f in files_to_delete: log_entry += f"   └── {f}\n"
     log_entry += "="*50 + "\n\n"
     
     for path in [local_notes_path, gdrive_notes_path]:
         existing_content = ""
         if os.path.exists(path):
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    existing_content = f.read()
-            except Exception:
-                pass
+                with open(path, "r", encoding="utf-8") as f: existing_content = f.read()
+            except Exception: pass
         with open(path, "w", encoding="utf-8") as f:
             f.write(log_entry + existing_content)
 
@@ -247,50 +217,62 @@ def run_upload():
 
 
 def run_download():
-    print(f"[+] 구글 드라이브 타겟 경로: {GDRIVE_SHARED_DIR}")
+    print(f"[+] 구글 드라이브 최종 동기화 경로: {GDRIVE_PAID_DIR}")
     print("[+] 유료 에셋 다운로드 및 동기화를 시작합니다. (팀원 권한)")
-    gdrive_manifest_path = os.path.join(GDRIVE_SHARED_DIR, MANIFEST_NAME)
+    
+    gdrive_manifest_path = os.path.join(GDRIVE_PAID_DIR, MANIFEST_NAME)
+    local_manifest_path = os.path.join(LOCAL_PAID_DIR, MANIFEST_NAME)
     
     if not os.path.exists(gdrive_manifest_path):
-        print("[-] 에러: 구글 드라이브에 매니페스트가 없습니다.\n    Setup.bat의 경로 설정이 잘못되었거나 마스터의 최초 업로드가 필요합니다.")
+        print("[-] 에러: 구글 드라이브에 매니페스트 파일이 존재하지 않습니다.\n    마스터의 최초 업로드가 필요합니다.")
         return
 
-    remote_manifest = load_json_manifest(gdrive_manifest_path)
+    remote_manifest = load_json(gdrive_manifest_path)
     remote_files = remote_manifest.get("files", {})
-    current_local_files = scan_local_assets()
-    
-    # [수정] 다운로드 단계에서도 시간 오차 보정 함수를 사용하여 불필요한 재다운로드 방지
-    files_to_download = []
-    for rel_path, remote_fingerprint in remote_files.items():
-        if rel_path not in current_local_files:
-            files_to_download.append(rel_path)
-        elif not is_fingerprint_equal(current_local_files[rel_path], remote_fingerprint):
-            files_to_download.append(rel_path)
+    local_manifest = load_json(local_manifest_path)
+    local_files = local_manifest.get("files", {})
 
-    files_to_delete = [p for p in current_local_files if p not in remote_files]
+    # 로컬 물리 파일 증발 여부 체크 가드
+    missing_physical_files = []
+    for rel_path in remote_files:
+        if not os.path.exists(os.path.join(LOCAL_PAID_DIR, rel_path)):
+            missing_physical_files.append(rel_path)
 
-    if not files_to_download and not files_to_delete:
-        print(f"[*] 이미 최신 버전 상태입니다. (최신 버전: Ver {remote_manifest.get('version')})")
+    # 매니페스트 버전 및 물리 파일 일치 시 0초 컷 종료
+    if remote_manifest.get("version") == local_manifest.get("version") and not missing_physical_files:
+        print(f"[*] 이미 최신 버전 상태입니다. (현재 버전: Ver {local_manifest.get('version')})")
         return
 
-    print(f"[*] 동기화 필요 -> 다운로드: {len(files_to_download)}개, 로컬 파일 정리: {len(files_to_delete)}개")
+    files_to_download = []
+    for rel_path, remote_md5 in remote_files.items():
+        if rel_path not in local_files or local_files[rel_path] != remote_md5 or rel_path in missing_physical_files:
+            files_to_download.append(rel_path)
 
-    copy_jobs = [
-        (os.path.join(GDRIVE_SHARED_DIR, rp), os.path.join(LOCAL_PAID_DIR, rp), rp)
-        for rp in files_to_download
-        if os.path.exists(os.path.join(GDRIVE_SHARED_DIR, rp))
-    ]
-    if copy_jobs:
-        print(f"[*] {len(copy_jobs)}개 파일 병렬 다운로드 시작 (워커 {MAX_WORKERS}개)")
-        parallel_copy(copy_jobs, "다운로드 완료")
+    files_to_delete = [p for p in local_files if p not in remote_files]
 
-    del_jobs = [(os.path.join(LOCAL_PAID_DIR, rp), rp) for rp in files_to_delete]
-    if del_jobs:
-        print(f"[*] {len(del_jobs)}개 로컬 고립 파일 병렬 정리")
-        parallel_delete(del_jobs, "로컬 고립 파일 제거")
+    print(f"[*] 동기화 진행 -> 다운로드 필요: {len(files_to_download)}개, 로컬 파일 정리: {len(files_to_delete)}개")
 
-    shutil.copy2(gdrive_manifest_path, os.path.join(LOCAL_PAID_DIR, MANIFEST_NAME))
-    gdrive_notes_path = os.path.join(GDRIVE_SHARED_DIR, NOTES_NAME)
+    # 차분 다운로드
+    for rel_path in files_to_download:
+        src = os.path.join(GDRIVE_PAID_DIR, rel_path)
+        dst = os.path.join(LOCAL_PAID_DIR, rel_path)
+        if os.path.exists(src):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            print(f" -> [다운로드 완료] {rel_path}")
+        else:
+            print(f" [-] 대기: 클라우드에서 가상 드라이브로 동기화 중인 파일입니다 -> {rel_path}")
+
+    # 고립 파일 제거
+    for rel_path in files_to_delete:
+        dst = os.path.join(LOCAL_PAID_DIR, rel_path)
+        if os.path.exists(dst):
+            os.remove(dst)
+            print(f" -> [로컬 고립 파일 제거] {rel_path}")
+
+    # 매니페스트 및 노트 최종 복사 동기화
+    save_json(local_manifest_path, remote_manifest)
+    gdrive_notes_path = os.path.join(GDRIVE_PAID_DIR, NOTES_NAME)
     if os.path.exists(gdrive_notes_path):
         shutil.copy2(gdrive_notes_path, os.path.join(LOCAL_PAID_DIR, NOTES_NAME))
 
@@ -299,11 +281,8 @@ def run_download():
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python sync_assets.py [--upload | --download]")
         sys.exit(1)
-        
-    mode = sys.argv[1]
-    if mode == "--upload":
+    if sys.argv[1] == "--upload":
         run_upload()
-    elif mode == "--download":
+    elif sys.argv[1] == "--download":
         run_download()

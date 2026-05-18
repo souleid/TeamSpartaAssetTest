@@ -1,5 +1,4 @@
 @echo off
-chcp 65001 >nul
 title [Team Member] Paid Assets Sync System
 
 echo =======================================================
