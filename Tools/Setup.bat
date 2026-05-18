@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 title Paid Assets Sync Setup
 
 echo =======================================================
@@ -34,4 +35,4 @@ echo 설정된 경로: %GDRIVE_PATH%
 echo 이제 UploadAssets.bat 또는 DownloadAssets.bat을 사용하세요.
 echo =======================================================
 echo.
-pause
+pause 
