@@ -2,6 +2,8 @@ import os
 import sys
 import json
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 # ==========================================
@@ -23,6 +25,7 @@ if os.path.exists(CONFIG_FILE_PATH):
 LOCAL_PAID_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../Content/PaidAssets"))
 MANIFEST_NAME = "UpdatedFileList.json"
 NOTES_NAME = "UpdatedNotes.txt"
+MAX_WORKERS = 8  # 구글 드라이브 동기화 폴더 대상이므로 과도하면 디스크/네트워크 경합으로 오히려 느려짐
 
 
 def get_asset_fingerprint(file_path):
@@ -91,6 +94,66 @@ def save_json_manifest(path, data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 
+_print_lock = threading.Lock()
+
+
+def _safe_print(msg):
+    with _print_lock:
+        print(msg)
+
+
+def parallel_copy(jobs, label):
+    """jobs: list of (src, dst, rel_path). 병렬 복사 후 (성공수, 실패수) 반환."""
+    total = len(jobs)
+    counter = {"done": 0, "failed": 0}
+    lock = threading.Lock()
+
+    def worker(job):
+        src, dst, rel_path = job
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            with lock:
+                counter["done"] += 1
+                idx = counter["done"] + counter["failed"]
+            _safe_print(f" -> [{label} {idx}/{total}] {rel_path}")
+        except Exception as e:
+            with lock:
+                counter["failed"] += 1
+                idx = counter["done"] + counter["failed"]
+            _safe_print(f" -> [실패 {idx}/{total}] {rel_path}: {e}")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        list(ex.map(worker, jobs))
+    return counter["done"], counter["failed"]
+
+
+def parallel_delete(jobs, label):
+    """jobs: list of (dst, rel_path). 병렬 삭제 후 (성공수, 실패수) 반환."""
+    total = len(jobs)
+    counter = {"done": 0, "failed": 0}
+    lock = threading.Lock()
+
+    def worker(job):
+        dst, rel_path = job
+        try:
+            if os.path.exists(dst):
+                os.remove(dst)
+            with lock:
+                counter["done"] += 1
+                idx = counter["done"] + counter["failed"]
+            _safe_print(f" -> [{label} {idx}/{total}] {rel_path}")
+        except Exception as e:
+            with lock:
+                counter["failed"] += 1
+                idx = counter["done"] + counter["failed"]
+            _safe_print(f" -> [실패 {idx}/{total}] {rel_path}: {e}")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        list(ex.map(worker, jobs))
+    return counter["done"], counter["failed"]
+
+
 def run_upload():
     print(f"[+] 구글 드라이브 타겟 경로: {GDRIVE_SHARED_DIR}")
     print("[+] 유료 에셋 업로드 프로세스를 시작합니다. (Git 마스터 권한)")
@@ -128,18 +191,18 @@ def run_upload():
     if not note_input:
         note_input = "정기 에셋 업데이트"
 
-    for rel_path in files_to_upload:
-        src = os.path.join(LOCAL_PAID_DIR, rel_path)
-        dst = os.path.join(GDRIVE_SHARED_DIR, rel_path)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(src, dst)
-        print(f" -> [업로드 완료] {rel_path}")
+    copy_jobs = [
+        (os.path.join(LOCAL_PAID_DIR, rp), os.path.join(GDRIVE_SHARED_DIR, rp), rp)
+        for rp in files_to_upload
+    ]
+    if copy_jobs:
+        print(f"[*] {len(copy_jobs)}개 파일 병렬 업로드 시작 (워커 {MAX_WORKERS}개)")
+        parallel_copy(copy_jobs, "업로드 완료")
 
-    for rel_path in files_to_delete:
-        dst = os.path.join(GDRIVE_SHARED_DIR, rel_path)
-        if os.path.exists(dst):
-            os.remove(dst)
-            print(f" -> [드라이브 파일 삭제] {rel_path}")
+    del_jobs = [(os.path.join(GDRIVE_SHARED_DIR, rp), rp) for rp in files_to_delete]
+    if del_jobs:
+        print(f"[*] {len(del_jobs)}개 파일 병렬 삭제 시작")
+        parallel_delete(del_jobs, "드라이브 파일 삭제")
 
     new_version = old_manifest.get("version", 0) + 1
     new_manifest = {
@@ -212,19 +275,19 @@ def run_download():
 
     print(f"[*] 동기화 필요 -> 다운로드: {len(files_to_download)}개, 로컬 파일 정리: {len(files_to_delete)}개")
 
-    for rel_path in files_to_download:
-        src = os.path.join(GDRIVE_SHARED_DIR, rel_path)
-        dst = os.path.join(LOCAL_PAID_DIR, rel_path)
-        if os.path.exists(src):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
-            print(f" -> [다운로드 완료] {rel_path}")
+    copy_jobs = [
+        (os.path.join(GDRIVE_SHARED_DIR, rp), os.path.join(LOCAL_PAID_DIR, rp), rp)
+        for rp in files_to_download
+        if os.path.exists(os.path.join(GDRIVE_SHARED_DIR, rp))
+    ]
+    if copy_jobs:
+        print(f"[*] {len(copy_jobs)}개 파일 병렬 다운로드 시작 (워커 {MAX_WORKERS}개)")
+        parallel_copy(copy_jobs, "다운로드 완료")
 
-    for rel_path in files_to_delete:
-        dst = os.path.join(LOCAL_PAID_DIR, rel_path)
-        if os.path.exists(dst):
-            os.remove(dst)
-            print(f" -> [로컬 고립 파일 제거] {rel_path}")
+    del_jobs = [(os.path.join(LOCAL_PAID_DIR, rp), rp) for rp in files_to_delete]
+    if del_jobs:
+        print(f"[*] {len(del_jobs)}개 로컬 고립 파일 병렬 정리")
+        parallel_delete(del_jobs, "로컬 고립 파일 제거")
 
     shutil.copy2(gdrive_manifest_path, os.path.join(LOCAL_PAID_DIR, MANIFEST_NAME))
     gdrive_notes_path = os.path.join(GDRIVE_SHARED_DIR, NOTES_NAME)
