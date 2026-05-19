@@ -3,23 +3,34 @@ import sys
 import json
 import shutil
 import hashlib
+import subprocess
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# 동시 처리 스레드 수 (구글 드라이브 I/O 병렬화)
+MAX_WORKERS = 8
 
 # ==========================================
 # 환경 설정
 # ==========================================
 GDRIVE_SHARED_DIR = "G:/내 드라이브/Unreal7th_PaidAssets"
 
-# Setup.bat이 생성한 config.json 로드
+# Setup이 생성한 config.json 로드 (UTF-8 → cp949 fallback: 구버전 bat이 만든 파일 호환)
 CONFIG_FILE_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 if os.path.exists(CONFIG_FILE_PATH):
-    try:
-        with open(CONFIG_FILE_PATH, "r", encoding="utf-8") as f:
-            config_data = json.load(f)
-            if "gdrive_path" in config_data:
-                GDRIVE_SHARED_DIR = config_data["gdrive_path"].strip()
-    except Exception as e:
-        print(f"[-] 설정 파일(config.json) 로드 실패: {e}")
+    config_data = None
+    for enc in ("utf-8-sig", "utf-8", "cp949"):
+        try:
+            with open(CONFIG_FILE_PATH, "r", encoding=enc) as f:
+                config_data = json.load(f)
+            break
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        except Exception as e:
+            print(f"[-] 설정 파일(config.json) 로드 실패: {e}")
+            break
+    if config_data and "gdrive_path" in config_data:
+        GDRIVE_SHARED_DIR = config_data["gdrive_path"].strip()
 
 LOCAL_PAID_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../Content/PaidAssets"))
 MANIFEST_NAME = "UpdatedFileList.json"
@@ -117,21 +128,38 @@ def run_upload():
     files_to_upload = []
     updated_remote_files = {}
 
-    # 하이브리드 교차 검증 진행
+    # 1단계: 캐시 일치 여부로 빠르게 분류 (해시 재계산 회피)
+    files_to_hash = []
     for rel_path, meta_val in current_meta_map.items():
-        if rel_path not in uploader_cache or not is_fingerprint_equal(uploader_cache[rel_path], meta_val) or rel_path not in remote_files:
-            full_path = os.path.join(LOCAL_PAID_DIR, rel_path)
-            md5_val = calculate_md5(full_path)
-            
-            if md5_val:
+        cache_hit = (
+            rel_path in uploader_cache
+            and is_fingerprint_equal(uploader_cache[rel_path], meta_val)
+            and rel_path in remote_files
+        )
+        if cache_hit:
+            updated_remote_files[rel_path] = remote_files[rel_path]
+        else:
+            files_to_hash.append(rel_path)
+
+    # 2단계: 변경 의심 파일들의 MD5를 병렬로 계산
+    if files_to_hash:
+        print(f"[*] 해시 검증 진행 중 ({len(files_to_hash)}개 파일, {MAX_WORKERS} threads)...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {
+                ex.submit(calculate_md5, os.path.join(LOCAL_PAID_DIR, rp)): rp
+                for rp in files_to_hash
+            }
+            for fut in as_completed(futures):
+                rel_path = futures[fut]
+                md5_val = fut.result()
+                if not md5_val:
+                    continue
                 if rel_path not in remote_files or remote_files[rel_path] != md5_val:
                     print(f"[*] 실제 변경 확인 (업로드 대기): {rel_path}")
                     files_to_upload.append(rel_path)
                 else:
                     print(f"[*] 메타데이터 변경되었으나 내용물이 일치함 (업로드 패스): {rel_path}")
                 updated_remote_files[rel_path] = md5_val
-        else:
-            updated_remote_files[rel_path] = remote_files[rel_path]
 
     files_to_delete = [p for p in remote_files if p not in current_meta_map]
 
@@ -148,13 +176,25 @@ def run_upload():
     if not note_input:
         note_input = "정기 에셋 업데이트"
 
-    # 차분 파일 업로드
-    for rel_path in files_to_upload:
+    # 차분 파일 업로드 (병렬)
+    def _upload_one(rel_path):
         src = os.path.join(LOCAL_PAID_DIR, rel_path)
         dst = os.path.join(GDRIVE_SHARED_DIR, rel_path)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
-        print(f" -> [업로드 완료] {rel_path}")
+        return rel_path
+
+    if files_to_upload:
+        total = len(files_to_upload)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(_upload_one, rp): rp for rp in files_to_upload}
+            for i, fut in enumerate(as_completed(futures), 1):
+                rp = futures[fut]
+                try:
+                    fut.result()
+                    print(f" -> [{i}/{total}] 업로드 완료: {rp}")
+                except Exception as e:
+                    print(f" [-] [{i}/{total}] 업로드 실패 ({rp}): {e}")
 
     # 구글 드라이브 삭제 파일 청소
     for rel_path in files_to_delete:
@@ -235,16 +275,30 @@ def run_download():
 
     print(f"[*] 동기화 진행 -> 다운로드 필요: {len(files_to_download)}개, 로컬 파일 정리: {len(files_to_delete)}개")
 
-    # 차분 다운로드
-    for rel_path in files_to_download:
+    # 차분 다운로드 (병렬)
+    def _download_one(rel_path):
         src = os.path.join(GDRIVE_SHARED_DIR, rel_path)
         dst = os.path.join(LOCAL_PAID_DIR, rel_path)
-        if os.path.exists(src):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
-            print(f" -> [다운로드 완료] {rel_path}")
-        else:
-            print(f" [-] 대기: 클라우드에서 가상 드라이브로 동기화 중인 파일입니다 -> {rel_path}")
+        if not os.path.exists(src):
+            return rel_path, False
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        return rel_path, True
+
+    if files_to_download:
+        total = len(files_to_download)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(_download_one, rp): rp for rp in files_to_download}
+            for i, fut in enumerate(as_completed(futures), 1):
+                rp = futures[fut]
+                try:
+                    _, ok = fut.result()
+                    if ok:
+                        print(f" -> [{i}/{total}] 다운로드 완료: {rp}")
+                    else:
+                        print(f" [-] [{i}/{total}] 대기: 클라우드 동기화 중 - {rp}")
+                except Exception as e:
+                    print(f" [-] [{i}/{total}] 다운로드 실패 ({rp}): {e}")
 
     # 고립 파일 제거
     for rel_path in files_to_delete:
@@ -262,6 +316,58 @@ def run_download():
     print(f"\n[+] 동기화 완료: Ver {remote_manifest.get('version')} 상태로 최신화되었습니다.")
 
 
+def run_setup():
+    """초기 설정: 구글 드라이브 경로를 받아 config.json에 UTF-8로 저장하고 git clean 가드 등록."""
+    print("=" * 55)
+    print("    유료 에셋 동기화 시스템 초기 설정")
+    print("=" * 55)
+    print()
+    print("본인의 PC에 마운트된 구글 드라이브 공유 폴더 경로를 입력하세요.")
+    print("(윈도우 탐색기에서 복사한 경로를 그대로 붙여넣으셔도 됩니다.)")
+    print()
+    default_path = r"G:\내 드라이브\Unreal7th_PaidAssets"
+    print(f"기본값 (엔터 클릭 시): {default_path}")
+    print("-" * 55)
+
+    user_input = input(">> 경로 입력: ").strip().strip('"').strip("'")
+    if not user_input:
+        user_input = default_path
+
+    config = {"gdrive_path": user_input}
+    try:
+        with open(CONFIG_FILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=4)
+        print(f"\n[+] config.json 저장 완료: {CONFIG_FILE_PATH}")
+    except Exception as e:
+        print(f"[-] config.json 저장 실패: {e}")
+        return
+
+    print()
+    print("-" * 55)
+    print("[Git Guard] git clean 시 유료 에셋 폴더 삭제 방지 가드를 등록합니다...")
+    try:
+        result = subprocess.run(
+            ["git", "config", "clean.exclude", "Content/PaidAssets"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
+        if result.returncode == 0:
+            print("[Git Guard] 가드 등록 완료!")
+        else:
+            print(f"[Git Guard] 가드 등록 실패: {result.stderr.strip()}")
+    except FileNotFoundError:
+        print("[Git Guard] git 명령을 찾을 수 없습니다. Git 설치 여부를 확인하세요.")
+    except Exception as e:
+        print(f"[Git Guard] 가드 등록 실패: {e}")
+    print("-" * 55)
+
+    print()
+    print("=" * 55)
+    print("[+] 설정이 성공적으로 완료되었습니다!")
+    print(f"    설정된 경로: {user_input}")
+    print("    이제 UploadAssets.bat 또는 DownloadAssets.bat을 사용하세요.")
+    print("=" * 55)
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.exit(1)
@@ -269,3 +375,5 @@ if __name__ == "__main__":
         run_upload()
     elif sys.argv[1] == "--download":
         run_download()
+    elif sys.argv[1] == "--setup":
+        run_setup()
