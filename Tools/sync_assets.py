@@ -152,11 +152,20 @@ def extract_drive_file_id(url):
 
 
 def build_zip(zip_path):
-    """Content/PaidAssets 전체를 zip으로 묶기 (manifest/notes 포함, 무압축)."""
-    tmp_zip = zip_path + ".tmp"
-    if os.path.exists(tmp_zip):
+    """Content/PaidAssets 전체를 zip으로 묶기 (manifest/notes 포함, 무압축).
+
+    GDrive의 공유 경로(.shortcut-targets-by-id/...)에서는 atomic rename이
+    불안정해서, 로컬 임시 폴더에 zip을 만든 뒤 shutil.copy2로 전송한다.
+    """
+    import time
+
+    local_tmp_dir = os.path.join(os.path.dirname(__file__), ".cache")
+    os.makedirs(local_tmp_dir, exist_ok=True)
+    local_zip = os.path.join(local_tmp_dir, os.path.basename(zip_path))
+
+    if os.path.exists(local_zip):
         try:
-            os.remove(tmp_zip)
+            os.remove(local_zip)
         except Exception:
             pass
 
@@ -168,17 +177,43 @@ def build_zip(zip_path):
             file_list.append((full, rel))
 
     total = len(file_list)
-    print(f"[*] zip 패키징 시작 ({total}개 파일, 무압축 모드)...")
-    with zipfile.ZipFile(tmp_zip, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+    print(f"[*] zip 패키징 시작 ({total}개 파일, 무압축 모드, 로컬 빌드)...")
+    with zipfile.ZipFile(local_zip, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
         for i, (full, rel) in enumerate(file_list, 1):
             zf.write(full, arcname=rel)
             if i % 50 == 0 or i == total:
                 print(f"    [{i}/{total}] {rel}")
 
-    # 같은 경로에 덮어쓰기 → GDrive Desktop이 동일 file ID로 새 리비전 업로드
-    os.replace(tmp_zip, zip_path)
-    size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-    print(f"[+] zip 생성 완료: {zip_path} ({size_mb:.1f} MB)")
+    local_size_mb = os.path.getsize(local_zip) / (1024 * 1024)
+    print(f"[*] 로컬 zip 완료: {local_size_mb:.1f} MB → GDrive 경로로 전송 중...")
+
+    try:
+        os.makedirs(os.path.dirname(zip_path), exist_ok=True)
+        shutil.copy2(local_zip, zip_path)
+    except Exception as e:
+        print(f"[-] GDrive 경로 복사 실패: {e}")
+        print(f"    로컬 zip은 남겨둡니다: {local_zip}")
+        raise
+
+    # GDrive Desktop이 즉시 가상화/숨김 처리하는 경우가 있어 짧게 재시도
+    size_mb = None
+    for _ in range(6):
+        try:
+            size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+            break
+        except FileNotFoundError:
+            time.sleep(0.5)
+
+    # 로컬 임시 zip 정리
+    try:
+        os.remove(local_zip)
+    except Exception:
+        pass
+
+    if size_mb is not None:
+        print(f"[+] zip 전송 완료: {zip_path} ({size_mb:.1f} MB)")
+    else:
+        print(f"[+] zip 전송 완료(파일 크기 확인 불가, GDrive 동기화 상태 확인 권장): {zip_path}")
 
 
 def run_upload():
@@ -241,9 +276,21 @@ def run_upload():
                 updated_files[rel_path] = md5_val
 
     files_deleted = [p for p in remote_files if p not in current_meta_map]
+    gdrive_zip_path = os.path.join(GDRIVE_SHARED_DIR, ZIP_NAME)
 
     if not files_changed and not files_deleted:
-        print("[*] 변경된 에셋이 없습니다. 업로드를 종료합니다.")
+        # 일반: 정말로 동기화 끝남
+        if os.path.exists(gdrive_zip_path):
+            print("[*] 변경된 에셋이 없습니다. 업로드를 종료합니다.")
+            return
+        # 복구: 매니페스트는 최신인데 GDrive zip이 누락 → 이전 업로드의 zip 단계 실패
+        print("[!] 변경된 에셋은 없지만 GDrive에 PaidAssets_latest.zip이 없습니다.")
+        print("    이전 업로드에서 zip 단계가 누락된 것 같습니다. 같은 매니페스트로 zip을 재빌드합니다.")
+        try:
+            build_zip(gdrive_zip_path)
+            print(f"[+] zip 재빌드 완료 (Ver {remote_manifest.get('version', '?')} 유지)")
+        except Exception as e:
+            print(f"[-] zip 재빌드 실패: {e}")
         return
 
     print(f"[*] 변경 사항 -> 추가/수정: {len(files_changed)}개, 삭제: {len(files_deleted)}개")
@@ -325,7 +372,6 @@ def run_upload():
             f.write(log_entry + existing_content)
 
     # zip 패키징 후 GDrive에 덮어쓰기 (Desktop이 새 리비전으로 동기화 → 공유 URL 유지)
-    gdrive_zip_path = os.path.join(GDRIVE_SHARED_DIR, ZIP_NAME)
     build_zip(gdrive_zip_path)
 
     print(f"\n[+] 성공: 버전 {new_version} 업로드 완료!")
@@ -401,7 +447,7 @@ def run_download():
         print(f"[-] 다운로드 중 오류: {e}")
         return
 
-    # zip 유효성 검사 (추출 전에 깨진 파일 받았는지 확인)
+    # zip 유효성 검사
     try:
         with zipfile.ZipFile(zip_cache_path, 'r') as zf:
             bad = zf.testzip()
@@ -412,34 +458,116 @@ def run_download():
         print("[-] 다운로드된 파일이 유효한 zip이 아닙니다. URL이 HTML 페이지를 가리키고 있을 수 있습니다.")
         return
 
-    # 로컬 PaidAssets 통째 비우기 → 추출
-    if os.path.exists(LOCAL_PAID_DIR):
-        print(f"[*] 기존 {LOCAL_PAID_DIR} 정리 중...")
-        try:
-            shutil.rmtree(LOCAL_PAID_DIR)
-        except Exception as e:
-            print(f"[-] 폴더 삭제 실패 (UE/탐색기에서 사용 중일 수 있음): {e}")
-            return
-    os.makedirs(LOCAL_PAID_DIR, exist_ok=True)
-
-    print(f"[*] 추출 중 -> {LOCAL_PAID_DIR}")
+    # zip 안의 매니페스트만 먼저 읽어 차분 적용 계획 수립
     try:
         with zipfile.ZipFile(zip_cache_path, 'r') as zf:
-            zf.extractall(LOCAL_PAID_DIR)
+            zip_names = set(zf.namelist())
+            if MANIFEST_NAME not in zip_names:
+                print(f"[-] zip 내부에 {MANIFEST_NAME}이 없습니다. 마스터 업로드를 확인하세요.")
+                return
+            with zf.open(MANIFEST_NAME) as mf:
+                remote_manifest = json.loads(mf.read().decode('utf-8'))
     except Exception as e:
-        print(f"[-] 추출 실패: {e}")
+        print(f"[-] 매니페스트 읽기 실패: {e}")
         return
+
+    remote_files = remote_manifest.get("files", {})
+
+    os.makedirs(LOCAL_PAID_DIR, exist_ok=True)
+    local_manifest_path = os.path.join(LOCAL_PAID_DIR, MANIFEST_NAME)
+    local_manifest = load_json(local_manifest_path)
+    local_files = local_manifest.get("files", {})
+
+    # 1) 분류: 매니페스트 신뢰로 빠른 스킵 vs 실제 MD5 검증 vs 신규 추출
+    files_to_extract = []
+    files_to_verify = []
+    for rel_path, remote_md5 in remote_files.items():
+        abs_path = os.path.join(LOCAL_PAID_DIR, rel_path)
+        if not os.path.exists(abs_path):
+            files_to_extract.append(rel_path)
+            continue
+        if local_files.get(rel_path) == remote_md5:
+            continue  # 매니페스트 일치 → 스킵
+        files_to_verify.append(rel_path)
+
+    # 2) 의심 파일만 MD5 병렬 검증
+    if files_to_verify:
+        print(f"[*] 무결성 검증 중 ({len(files_to_verify)}개 파일, {MAX_WORKERS} threads)...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {
+                ex.submit(calculate_md5, os.path.join(LOCAL_PAID_DIR, rp)): rp
+                for rp in files_to_verify
+            }
+            for fut in as_completed(futures):
+                rel_path = futures[fut]
+                actual = fut.result()
+                if actual != remote_files[rel_path]:
+                    files_to_extract.append(rel_path)
+
+    # 3) 매니페스트에 없는 로컬 파일 = 고립 파일
+    files_to_delete = []
+    for root, dirs, files in os.walk(LOCAL_PAID_DIR):
+        for f in files:
+            if f in [MANIFEST_NAME, NOTES_NAME]:
+                continue
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, LOCAL_PAID_DIR).replace("\\", "/")
+            if rel not in remote_files:
+                files_to_delete.append(rel)
+
+    if not files_to_extract and not files_to_delete:
+        print("[*] 이미 최신 상태입니다 (변경된 파일 없음).")
+    else:
+        print(f"[*] 적용 -> 추가/덮어쓰기: {len(files_to_extract)}개, 삭제: {len(files_to_delete)}개")
+
+    # 4) 변경된 파일만 zip에서 개별 추출
+    if files_to_extract:
+        with zipfile.ZipFile(zip_cache_path, 'r') as zf:
+            for i, rel_path in enumerate(files_to_extract, 1):
+                if rel_path not in zip_names:
+                    print(f" [-] zip에 없음 (스킵): {rel_path}")
+                    continue
+                try:
+                    zf.extract(rel_path, LOCAL_PAID_DIR)
+                    print(f" -> [{i}/{len(files_to_extract)}] 추출: {rel_path}")
+                except Exception as e:
+                    print(f" [-] 추출 실패 ({rel_path}): {e}")
+
+    # 5) 고립 파일 삭제
+    for rel_path in files_to_delete:
+        full = os.path.join(LOCAL_PAID_DIR, rel_path)
+        try:
+            os.remove(full)
+            print(f" -> [삭제] {rel_path}")
+        except Exception as e:
+            print(f" [-] 삭제 실패 ({rel_path}): {e}")
+
+    # 6) 빈 디렉터리 정리
+    for root, dirs, files in os.walk(LOCAL_PAID_DIR, topdown=False):
+        for d in dirs:
+            full = os.path.join(root, d)
+            try:
+                if not os.listdir(full):
+                    os.rmdir(full)
+            except Exception:
+                pass
+
+    # 7) 매니페스트/노트 동기화 (항상 zip 기준으로 최신화)
+    try:
+        with zipfile.ZipFile(zip_cache_path, 'r') as zf:
+            zf.extract(MANIFEST_NAME, LOCAL_PAID_DIR)
+            if NOTES_NAME in zip_names:
+                zf.extract(NOTES_NAME, LOCAL_PAID_DIR)
+    except Exception as e:
+        print(f"[-] 매니페스트/노트 갱신 실패: {e}")
 
     try:
         os.remove(zip_cache_path)
     except Exception:
         pass
 
-    # 버전 표시
-    local_manifest_path = os.path.join(LOCAL_PAID_DIR, MANIFEST_NAME)
-    manifest = load_json(local_manifest_path)
-    version = manifest.get("version", "?")
-    file_count = len(manifest.get("files", {}))
+    version = remote_manifest.get("version", "?")
+    file_count = len(remote_files)
     print(f"\n[+] 동기화 완료: Ver {version} ({file_count}개 파일)")
 
 
